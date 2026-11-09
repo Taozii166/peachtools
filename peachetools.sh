@@ -86,6 +86,314 @@ route_test() {
   done
 }
 
+switch_mirrors() {
+  if ((EUID != 0)); then err '切换软件源需要 root 权限。'; return 1; fi
+  local distro version provider mirror_host backup stamp file tmp changed=0 matched=0
+  local apt_main_root='' apt_security_root='' apt_ports_root='' apt_codename='' apt_arch='' candidate name main_root security_root ports_root suite
+  if [[ -r /etc/os-release ]]; then . /etc/os-release; else err '无法识别系统版本。'; return 1; fi
+  distro=${ID:-}; version=${VERSION_ID:-}
+  case "$distro" in
+    centos|rhel|rocky|almalinux|ol|anolis) ;;
+    ubuntu|debian) ;;
+    *) err "暂不支持自动切换 $PRETTY_NAME 的软件源。"; return 1 ;;
+  esac
+  printf '检测到系统：%s %s\n' "$distro" "$version"
+  if [[ $distro == ubuntu || $distro == debian ]]; then
+    printf '1. 自动检测可用镜像（推荐）\n2. 阿里云\n3. 腾讯云\n4. 中科大\n5. 清华大学\nq. 返回\n'
+    read -r -p '请选择 [1-5/q]: ' provider || return 0
+    apt_codename=${VERSION_CODENAME:-}
+    if [[ -z $apt_codename ]]; then apt_codename=$(awk -F= '$1=="VERSION_CODENAME" {gsub(/"/, "", $2); print $2}' /etc/os-release); fi
+    [[ -n $apt_codename ]] || { err '无法读取发行版代号，不能探测匹配的软件源。'; return 1; }
+    apt_arch=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    if [[ $distro == ubuntu && $apt_arch != amd64 && $apt_arch != i386 ]]; then
+      apt_ports_root=true
+    else
+      apt_ports_root=false
+    fi
+    case "$provider" in
+      1|2|3|4|5) ;;
+      q|Q) return 0 ;;
+      *) err '选项无效。'; return 1 ;;
+    esac
+    case "$provider" in
+      1)
+        if [[ $distro == debian ]]; then
+          candidates=(
+            '阿里云|https://mirrors.aliyun.com/debian|https://mirrors.aliyun.com/debian-security'
+            '腾讯云|https://mirrors.cloud.tencent.com/debian|https://mirrors.cloud.tencent.com/debian-security'
+            '中科大|https://mirrors.ustc.edu.cn/debian|https://mirrors.ustc.edu.cn/debian-security'
+            '清华大学|https://mirrors.tuna.tsinghua.edu.cn/debian|https://mirrors.tuna.tsinghua.edu.cn/debian-security'
+            'Debian 官方|https://deb.debian.org/debian|https://security.debian.org/debian-security'
+          )
+        else
+          if [[ $apt_ports_root == true ]]; then
+            candidates=(
+              '阿里云|https://mirrors.aliyun.com/ubuntu-ports|https://mirrors.aliyun.com/ubuntu-ports'
+              '腾讯云|https://mirrors.cloud.tencent.com/ubuntu-ports|https://mirrors.cloud.tencent.com/ubuntu-ports'
+              '中科大|https://mirrors.ustc.edu.cn/ubuntu-ports|https://mirrors.ustc.edu.cn/ubuntu-ports'
+              '清华大学|https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports|https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports'
+              'Ubuntu 官方|https://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports'
+            )
+          else
+            candidates=(
+              '阿里云|https://mirrors.aliyun.com/ubuntu|https://mirrors.aliyun.com/ubuntu'
+              '腾讯云|https://mirrors.cloud.tencent.com/ubuntu|https://mirrors.cloud.tencent.com/ubuntu'
+              '中科大|https://mirrors.ustc.edu.cn/ubuntu|https://mirrors.ustc.edu.cn/ubuntu'
+              '清华大学|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu'
+              'Ubuntu 官方|https://archive.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu'
+            )
+          fi
+        fi
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then err '自动探测需要 curl 或 wget。'; return 1; fi
+        found_mirror=0
+        for candidate in "${candidates[@]}"; do
+          IFS='|' read -r name main_root security_root <<< "$candidate"
+          mirror_ok=1
+          for suite in "$apt_codename" "${apt_codename}-updates"; do
+            probe_url="$main_root/dists/$suite/InRelease"
+            if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 5 --max-time 12 "$probe_url" -o /dev/null >/dev/null 2>&1 || mirror_ok=0
+            else wget -q --spider -T 12 "$probe_url" >/dev/null 2>&1 || mirror_ok=0; fi
+          done
+          if [[ $distro == debian ]]; then probe_url="$security_root/dists/${apt_codename}-security/InRelease"
+          else probe_url="$security_root/dists/${apt_codename}-security/InRelease"; fi
+          if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 5 --max-time 12 "$probe_url" -o /dev/null >/dev/null 2>&1 || mirror_ok=0
+          else wget -q --spider -T 12 "$probe_url" >/dev/null 2>&1 || mirror_ok=0; fi
+          if ((mirror_ok)); then found_mirror=1; break; fi
+          printf '  %s：仓库索引不可达，继续检查下一个候选源。\n' "$name"
+        done
+        ((found_mirror)) || { err '候选镜像均未通过索引连通性检查，源配置未修改。'; return 1; }
+        printf '自动选择可用镜像：%s\n' "$name"
+        apt_main_root=$main_root; apt_security_root=$security_root
+        if [[ $distro == ubuntu ]]; then apt_ports_root=$main_root; fi
+        mirror_host=$name
+        ;;
+      2) name=阿里云; apt_main_root=https://mirrors.aliyun.com/debian; apt_security_root=https://mirrors.aliyun.com/debian-security; apt_ports_root=https://mirrors.aliyun.com/ubuntu-ports; mirror_host=mirrors.aliyun.com ;;
+      3) name=腾讯云; apt_main_root=https://mirrors.cloud.tencent.com/debian; apt_security_root=https://mirrors.cloud.tencent.com/debian-security; apt_ports_root=https://mirrors.cloud.tencent.com/ubuntu-ports; mirror_host=mirrors.cloud.tencent.com ;;
+      4) name=中科大; apt_main_root=https://mirrors.ustc.edu.cn/debian; apt_security_root=https://mirrors.ustc.edu.cn/debian-security; apt_ports_root=https://mirrors.ustc.edu.cn/ubuntu-ports; mirror_host=mirrors.ustc.edu.cn ;;
+      5) name=清华大学; apt_main_root=https://mirrors.tuna.tsinghua.edu.cn/debian; apt_security_root=https://mirrors.tuna.tsinghua.edu.cn/debian-security; apt_ports_root=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports; mirror_host=mirrors.tuna.tsinghua.edu.cn ;;
+    esac
+    if [[ $distro == ubuntu ]]; then
+      if [[ $apt_ports_root == true ]]; then apt_main_root=$apt_ports_root; apt_security_root=$apt_ports_root; fi
+      if [[ $apt_ports_root != true && $apt_ports_root != https://* ]]; then apt_ports_root=$apt_main_root; fi
+      # Provider roots for Ubuntu point to the same archive endpoint.
+      if [[ $provider != 1 ]]; then apt_main_root=${apt_main_root/debian/ubuntu}; apt_security_root=$apt_main_root; fi
+      if [[ $apt_ports_root != https://* ]]; then apt_ports_root=${apt_main_root%/ubuntu}/ubuntu-ports; fi
+    fi
+  else
+    printf '1. 阿里云镜像\n2. 腾讯云镜像\nq. 返回\n'
+    read -r -p '请选择镜像 [1-2/q]: ' provider || return 0
+    case "$provider" in
+      1) mirror_host=mirrors.aliyun.com ;;
+      2) mirror_host=mirrors.cloud.tencent.com ;;
+      q|Q) return 0 ;;
+      *) err '选项无效。'; return 1 ;;
+    esac
+  fi
+
+  stamp=$(date +%Y%m%d%H%M%S)
+  backup="/root/peachtools-sources-backup-$stamp"
+  mkdir -m 700 -p "$backup" || { err '无法创建源配置备份目录。'; return 1; }
+  if [[ $distro == ubuntu || $distro == debian ]]; then
+    command -v apt-get >/dev/null 2>&1 || { err '找不到 apt-get。'; return 1; }
+    mkdir -p "$backup/apt"
+    [[ -f /etc/apt/sources.list ]] && cp -a /etc/apt/sources.list "$backup/apt/"
+    [[ -d /etc/apt/sources.list.d ]] && cp -a /etc/apt/sources.list.d "$backup/apt/"
+    # Replace only standard Ubuntu/Debian archive hosts; third-party repositories remain untouched.
+    local -a aptfiles=(/etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
+    for file in "${aptfiles[@]}"; do
+      [[ -f $file ]] || continue
+      if [[ $distro == ubuntu ]]; then
+        grep -Eq 'archive\.ubuntu\.com/ubuntu|security\.ubuntu\.com/ubuntu|ports\.ubuntu\.com/ubuntu-ports|mirrors\.(aliyun\.com|cloud\.tencent\.com|tencent\.com|ustc\.edu\.cn|tuna\.tsinghua\.edu\.cn)/ubuntu(-ports)?' "$file" || continue
+      else
+        grep -Eq '(deb|security|ftp)\.debian\.org/debian|mirrors\.(aliyun\.com|cloud\.tencent\.com|tencent\.com|ustc\.edu\.cn|tuna\.tsinghua\.edu\.cn)/debian(-security)?' "$file" || continue
+      fi
+      ((matched+=1))
+      tmp=$(mktemp "${file}.peachtools.XXXXXX") || return 1
+      cp -p "$file" "$tmp" || { rm -f "$tmp"; return 1; }
+      if [[ $distro == ubuntu ]]; then
+        if [[ $mirror_host == mirrors.aliyun.com ]]; then
+          sed -i -E "s#https?://(archive|security)\\.ubuntu\\.com/ubuntu#${apt_main_root}#g; s#https?://ports\\.ubuntu\\.com/ubuntu-ports#${apt_ports_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/ubuntu-ports#${apt_ports_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/ubuntu#${apt_main_root}#g" "$tmp"
+        else
+          sed -i -E "s#https?://(archive|security)\\.ubuntu\\.com/ubuntu#${apt_main_root}#g; s#https?://ports\\.ubuntu\\.com/ubuntu-ports#${apt_ports_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/ubuntu-ports#${apt_ports_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/ubuntu#${apt_main_root}#g" "$tmp"
+        fi
+      else
+        if [[ $mirror_host == mirrors.aliyun.com ]]; then
+          sed -i -E "s#https?://(deb|security|ftp)\\.debian\\.org/debian-security#${apt_security_root}#g; s#https?://(deb|security|ftp)\\.debian\\.org/debian#${apt_main_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/debian-security#${apt_security_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/debian#${apt_main_root}#g" "$tmp"
+        else
+          sed -i -E "s#https?://(deb|security|ftp)\\.debian\\.org/debian-security#${apt_security_root}#g; s#https?://(deb|security|ftp)\\.debian\\.org/debian#${apt_main_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/debian-security#${apt_security_root}#g; s#https?://mirrors\\.(aliyun\\.com|cloud\\.tencent\\.com|tencent\\.com|ustc\\.edu\\.cn|tuna\\.tsinghua\\.edu\\.cn)/debian#${apt_main_root}#g" "$tmp"
+        fi
+      fi
+      if ! cmp -s "$file" "$tmp"; then mv -f "$tmp" "$file" || return 1; ((changed+=1)); else rm -f "$tmp"; fi
+    done
+    # Fresh Debian/Ubuntu installs can contain only a CD-ROM source and no
+    # internet repository. In that case, disable CD-ROM entries and add a
+    # normal network source instead of treating the absence as an error.
+    if ((matched == 0)); then
+      local added_file=/etc/apt/sources.list
+      for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f $file ]] || continue
+        grep -Eiq '^[[:space:]]*deb(-src)?[[:space:]]+cdrom:' "$file" || continue
+        tmp=$(mktemp "${file}.peachtools.XXXXXX") || return 1
+        cp -p "$file" "$tmp" || { rm -f "$tmp"; return 1; }
+        sed -i -E 's#^([[:space:]]*deb(-src)?[[:space:]]+cdrom:)#\# Disabled by Peach Tools (CD-ROM source): \1#I' "$tmp"
+        if ! cmp -s "$file" "$tmp"; then mv -f "$tmp" "$file" || return 1; ((changed+=1)); else rm -f "$tmp"; fi
+      done
+      tmp=$(mktemp "${added_file}.peachtools.XXXXXX") || return 1
+      if [[ -f $added_file ]]; then cp -p "$added_file" "$tmp" || { rm -f "$tmp"; return 1; }
+      else chmod 644 "$tmp"; fi
+      if [[ $distro == debian ]]; then
+        if [[ ${version%%.*} -ge 12 ]]; then components='main contrib non-free non-free-firmware'; else components='main contrib non-free'; fi
+      else components='main restricted universe multiverse'; fi
+      {
+        printf '\n# Peach Tools: detected usable network mirror\n'
+        printf 'deb %s %s %s\n' "$apt_main_root" "$apt_codename" "$components"
+        printf 'deb %s %s-updates %s\n' "$apt_main_root" "$apt_codename" "$components"
+        printf 'deb %s %s-security %s\n' "$apt_security_root" "$apt_codename" "$components"
+      } >> "$tmp"
+      mv -f "$tmp" "$added_file" || { rm -f "$tmp"; err '新增网络软件源配置失败。'; return 1; }
+      ((changed+=1))
+      echo "未发现现有网络源，已新增：$added_file"
+    fi
+    if ((changed == 0 && matched > 0)); then
+      echo '源配置已指向所选镜像，文件无需修改。'
+      if apt-get update; then echo '完成：APT 软件包索引已刷新。'; else err 'apt-get update 失败，源配置未改动。'; return 1; fi
+      return 0
+    fi
+    if ((changed == 0)); then err '没有找到可识别的 Ubuntu/Debian 官方或常见镜像源条目，配置未改动。'; return 1; fi
+    echo "已备份原配置：$backup"
+    if apt-get update; then echo '完成：APT 官方软件源已切换并刷新索引。'; else
+      cp -a "$backup/apt/sources.list" /etc/apt/sources.list 2>/dev/null || true
+      if [[ -d $backup/apt/sources.list.d ]]; then rm -rf /etc/apt/sources.list.d; cp -a "$backup/apt/sources.list.d" /etc/apt/; fi
+      err "apt-get update 失败，已恢复备份配置：$backup"; return 1
+    fi
+  else
+    local repo_dir=/etc/yum.repos.d
+    [[ -d $repo_dir ]] || { err "找不到 $repo_dir。"; return 1; }
+    command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || { err '找不到 dnf/yum。'; return 1; }
+    cp -a "$repo_dir" "$backup/yum.repos.d" || { err 'YUM/DNF 配置备份失败。'; return 1; }
+    # Switch only known upstream CentOS/RHEL mirror hosts, preserving repository paths and IDs.
+    local old_hosts='mirror\.centos\.org|vault\.centos\.org|mirror\.stream\.centos\.org|download\.fedoraproject\.org|mirrors\.rockylinux\.org|repo\.almalinux\.org'
+    local yum_root
+    if [[ $mirror_host == mirrors.aliyun.com ]]; then yum_root=https://mirrors.aliyun.com; else yum_root=https://mirrors.cloud.tencent.com; fi
+    # CentOS 7/8 are EOL: replacing only the hostname leaves obsolete mirrorlist
+    # and release paths. Use the mirror providers' complete legacy repo files.
+    local major=${version%%.*} repo_url repo_tmp repo_target
+    if [[ $distro == centos && ( $major == 7 || $major == 8 ) ]]; then
+      if [[ $major == 7 ]]; then
+        if [[ $mirror_host == mirrors.aliyun.com ]]; then
+          repo_url=https://mirrors.aliyun.com/repo/Centos-7.repo
+        else
+          repo_url=https://mirrors.tencent.com/repo/centos7_base.repo
+        fi
+      else
+        if [[ $mirror_host == mirrors.aliyun.com ]]; then
+          repo_url=https://mirrors.aliyun.com/repo/Centos-vault-8.5.2111.repo
+        else
+          repo_url=https://mirrors.tencent.com/repo/centos8_base.repo
+        fi
+      fi
+      repo_target="$repo_dir/CentOS-Base.repo"
+      repo_tmp=$(mktemp "$repo_dir/.CentOS-Base.repo.peachtools.XXXXXX") || return 1
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 8 --max-time 60 "$repo_url" -o "$repo_tmp"
+      elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -O "$repo_tmp" "$repo_url"
+      else
+        rm -f "$repo_tmp"; err '下载仓库配置需要 curl 或 wget。'; return 1
+      fi
+      if (($? != 0)) || ! grep -q '^\[' "$repo_tmp"; then
+        rm -f "$repo_tmp"; err "无法从镜像站获取有效的 CentOS $major 仓库配置：$repo_url"; return 1
+      fi
+      chmod --reference="$repo_target" "$repo_tmp" 2>/dev/null || chmod 644 "$repo_tmp"
+      if ! mv -f "$repo_tmp" "$repo_target"; then rm -f "$repo_tmp"; err '安装仓库配置失败。'; return 1; fi
+      changed=1
+    fi
+    for file in "$repo_dir"/*.repo; do
+      [[ -f $file ]] || continue
+      # Legacy CentOS base repo was replaced with a complete provider template above.
+      [[ $distro == centos && ( $major == 7 || $major == 8 ) && $file == "$repo_target" ]] && continue
+      grep -Eq "$old_hosts" "$file" || continue
+      tmp=$(mktemp "${file}.peachtools.XXXXXX") || return 1
+      cp -p "$file" "$tmp" || { rm -f "$tmp"; return 1; }
+      sed -i -E "s#https?://(mirror|vault)\\.centos\\.org#${yum_root}/centos#g; s#https?://mirror\\.stream\\.centos\\.org#${yum_root}/centos-stream#g; s#https?://download\\.fedoraproject\\.org/pub/epel#${yum_root}/epel#g; s#https?://mirrors\\.rockylinux\\.org#${yum_root}/rocky#g; s#https?://repo\\.almalinux\\.org#${yum_root}/almalinux#g" "$tmp"
+      if ! cmp -s "$file" "$tmp"; then mv -f "$tmp" "$file" || return 1; ((changed+=1)); else rm -f "$tmp"; fi
+    done
+    if ((changed == 0)); then err '未找到已知官方仓库地址，配置未改动。该系统可能使用了厂商定制源。'; return 1; fi
+    echo "已备份原配置：$backup"
+    if command -v dnf >/dev/null 2>&1; then dnf clean all && dnf makecache; else yum clean all && yum makecache; fi
+    if (($? == 0)); then echo '完成：YUM/DNF 官方软件源已切换并刷新缓存。'; else
+      rm -rf "$repo_dir"; cp -a "$backup/yum.repos.d" "$repo_dir"
+      err "仓库缓存刷新失败，已恢复备份配置：$backup"; return 1
+    fi
+  fi
+}
+
+install_ookla_speedtest() {
+  local installer installer_url manager
+  if ((EUID != 0)); then err '安装 Ookla Speedtest CLI 需要 root 权限。'; return 1; fi
+  if command -v apt-get >/dev/null 2>&1; then
+    installer_url=https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh
+    manager=apt
+  elif command -v dnf >/dev/null 2>&1; then
+    installer_url=https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh
+    manager=dnf
+  elif command -v yum >/dev/null 2>&1; then
+    installer_url=https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh
+    manager=yum
+  else
+    err '未识别 apt/dnf/yum，无法安装 Ookla Speedtest CLI。'; return 1
+  fi
+  installer=$(mktemp) || return 1
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 8 --max-time 60 "$installer_url" -o "$installer"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 60 -O "$installer" "$installer_url"
+  else
+    rm -f "$installer"; err '安装 Ookla Speedtest CLI 需要 curl 或 wget。'; return 1
+  fi
+  if (($? != 0)) || ! head -n 1 "$installer" | grep -q '^#!/'; then
+    rm -f "$installer"; err '未能下载有效的 Ookla 软件源安装脚本。'; return 1
+  fi
+  echo '未检测到 speedtest，正在添加 Ookla 官方软件源并安装客户端…'
+  if ! bash "$installer"; then rm -f "$installer"; err 'Ookla 软件源配置失败。'; return 1; fi
+  rm -f "$installer"
+  case "$manager" in
+    apt) apt-get update && apt-get install -y speedtest ;;
+    dnf) dnf install -y speedtest ;;
+    yum) yum install -y speedtest ;;
+  esac
+}
+
+speed_test() {
+  local speedtest_bin
+  if ((EUID != 0)); then err '带宽测试功能需要 root 运行，以便自动安装测试客户端。'; return 1; fi
+  speedtest_bin=$(command -v speedtest 2>/dev/null || true)
+  if [[ -z $speedtest_bin ]]; then
+    if command -v speedtest-cli >/dev/null 2>&1; then
+      speedtest_bin=$(command -v speedtest-cli)
+      echo '使用系统中已有的 speedtest-cli，自动选择低延迟测试节点。'
+      "$speedtest_bin" --secure
+      return $?
+    fi
+    install_ookla_speedtest || return 1
+    speedtest_bin=$(command -v speedtest 2>/dev/null || true)
+  fi
+  [[ -n $speedtest_bin ]] || { err '安装完成后仍找不到 speedtest 命令。'; return 1; }
+  printf '开始测速：Ookla 将自动选择低延迟节点，并测试下载、上传及延迟。\n'
+  printf '测速会产生实际网络流量，期间结果会受线路负载和目标节点影响。\n\n'
+  "$speedtest_bin" --accept-license --accept-gdpr
+}
+
+if [[ ${1:-} == --speed-test ]]; then
+  speed_test
+  exit $?
+fi
+
+if [[ ${1:-} == --mirror-source ]]; then
+  switch_mirrors
+  exit $?
+fi
+
 if [[ ${1:-} == --route-test ]]; then
   route_test
   exit $?
@@ -98,15 +406,19 @@ if [[ ${1:-} != --batch-ip ]]; then
 ========== Peach Tools ==========
 1. 批量添加 IP
 2. 中国大陆三网路由检测
-3. 退出
+3. 测试下载/上传带宽（自动选择就近节点）
+4. 切换软件源（自动检测可用源）
+5. 退出
 ===================================
 EOF
-    read -r -p '请选择功能 [1-3]: ' choice || exit 0
+    read -r -p '请选择功能 [1-5]: ' choice || exit 0
     case "$choice" in
       1) bash "$0" --batch-ip ;;
       2) bash "$0" --route-test ;;
-      3|q|Q|exit|EXIT) exit 0 ;;
-      *) echo '选项无效，请输入 1、2 或 3。' ;;
+      3) bash "$0" --speed-test ;;
+      4) bash "$0" --mirror-source ;;
+      5|q|Q|exit|EXIT) exit 0 ;;
+      *) echo '选项无效，请输入 1、2、3、4 或 5。' ;;
     esac
   done
 fi
